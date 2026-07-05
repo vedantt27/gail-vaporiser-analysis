@@ -1,0 +1,342 @@
+
+
+import math
+
+# ──────────────────────────────────────────────────────────────────────────
+# 1. AMBIENT CONDITIONS  (Mandideep, Madhya Pradesh)
+# ──────────────────────────────────────────────────────────────────────────
+AMBIENT = {
+    "Summer": {
+        "T_amb_C": 42.0,          # °C  (peak summer DBT)
+        "T_amb_K": 42.0 + 273.15,
+        "relative_humidity": 0.30, # 30 %
+        "wind_speed_mps": 1.5,    # m/s
+    },
+    "Winter": {
+        "T_amb_C": 4.0,           # °C  (typical winter DBT)
+        "T_amb_K": 4.0 + 273.15,
+        "relative_humidity": 0.75,
+        "wind_speed_mps": 1.5,
+    },
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2. LNG / NG PROCESS CONDITIONS  (from P&ID line specs & equipment tags)
+# ──────────────────────────────────────────────────────────────────────────
+LNG_INLET_TEMP_C   = -162.0          # °C  (LNG saturation temp at ~1 bar)
+LNG_INLET_TEMP_K   = LNG_INLET_TEMP_C + 273.15
+
+# Outlet NG temperature is typically set to (T_amb - 10°C) minimum
+# We enforce a floor of +5 °C for safety
+def outlet_temp_K(T_amb_C):
+    return max(T_amb_C - 10.0, 5.0) + 273.15
+
+# LNG / NG thermal properties (representative values for pure methane basis)
+LNG_LATENT_HEAT_kJ_kg   = 509.0   # kJ/kg  vaporisation heat at ~1 bar
+CP_GAS_kJ_kgK           = 2.23    # kJ/(kg·K) avg Cp of NG (superheating phase)
+LNG_DENSITY_kg_m3       = 430.0   # kg/m³  (LNG in storage)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3. VAPORISER STAGE DEFINITIONS  (from P&ID pressure specs & line services)
+# ──────────────────────────────────────────────────────────────────────────
+#
+#  LP Vaporiser : Low-pressure regasification (city gas / domestic supply)
+#  MP Vaporiser : Medium-pressure (industrial / CNG mother station inlet)
+#  HP Vaporiser : High-pressure (LCNG dispenser / HP compression inlet)
+#
+VAPORISERS = {
+    "LP_Vaporiser": {
+        "label"         : "LP Vaporiser (Low Pressure)",
+        "inlet_press_barg": 4.0,
+        "outlet_press_barg": 3.5,
+        "flow_rate_kg_h": 500.0,   # kg/h  design throughput
+        "safety_factor" : 1.15,    # 15 % margin
+        "fin_area_m2"   : 180.0,   # effective heat-transfer area (fins)
+        "U_W_m2K"       : 25.0,    # Overall HTC for AAV (W/m²·K) – typical
+    },
+    "MP_Vaporiser": {
+        "label"         : "MP Vaporiser (Medium Pressure)",
+        "inlet_press_barg": 18.0,
+        "outlet_press_barg": 17.0,
+        "flow_rate_kg_h": 1000.0,
+        "safety_factor" : 1.15,
+        "fin_area_m2"   : 300.0,
+        "U_W_m2K"       : 22.0,
+    },
+    "HP_Vaporiser": {
+        "label"         : "HP Vaporiser (High Pressure)",
+        "inlet_press_barg": 200.0,
+        "outlet_press_barg": 195.0,
+        "flow_rate_kg_h": 300.0,
+        "safety_factor" : 1.20,    # higher margin for HP safety
+        "fin_area_m2"   : 120.0,
+        "U_W_m2K"       : 18.0,   # reduced HTC at high P due to dense gas
+    },
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4. HEAT DUTY CALCULATION FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────
+
+def calc_heat_duty(vap: dict, T_amb_C: float) -> dict:
+    """
+    Q_total = Q_sensible_liquid  (warming LNG from -162°C to boiling point)
+            + Q_latent           (vaporisation)
+            + Q_superheat        (warming vapour to outlet temp)
+
+    Returns duty in kW and MJ/h.
+    """
+    mdot_kgs = vap["flow_rate_kg_h"] / 3600.0   # kg/s
+
+    T_boil_K  = LNG_INLET_TEMP_K              # approx inlet = boiling point
+    T_out_K   = outlet_temp_K(T_amb_C)
+
+    # Sensible heat of liquid phase (LNG warming to boiling) – small here
+    # because LNG enters already near saturation; kept for completeness
+    T_liq_warm = 5.0  # K   (small sub-cooling)
+    CP_liq     = 3.5  # kJ/(kg·K) liquid LNG specific heat
+    Q_liq_sens = mdot_kgs * CP_liq * T_liq_warm   # kW
+
+    # Latent heat
+    Q_latent   = mdot_kgs * LNG_LATENT_HEAT_kJ_kg  # kW
+
+    # Superheat (vapour from boiling point to outlet temp)
+    delta_T_superheat = T_out_K - T_boil_K         # K
+    Q_superheat = mdot_kgs * CP_GAS_kJ_kgK * delta_T_superheat  # kW
+
+    Q_net  = Q_liq_sens + Q_latent + Q_superheat
+    Q_design = Q_net * vap["safety_factor"]
+
+    # LMTD-based area check
+    # Hot side = ambient air;  Cold side = LNG/NG
+    dT1 = (T_amb_C + 273.15) - T_boil_K          # at LNG inlet
+    dT2 = (T_amb_C + 273.15) - T_out_K            # at NG outlet
+    if dT1 <= 0:
+        dT1 = 0.5   # clamp to avoid math domain error in extreme winter
+    if dT2 <= 0:
+        dT2 = 0.5
+    if abs(dT1 - dT2) < 0.01:
+        LMTD = dT1
+    else:
+        LMTD = (dT1 - dT2) / math.log(dT1 / dT2)
+
+    U_kW  = vap["U_W_m2K"] / 1000.0               # kW/(m²·K)
+    A_required_m2 = Q_design / (U_kW * LMTD) if LMTD > 0 else float("inf")
+
+    return {
+        "Q_sensible_liq_kW"  : round(Q_liq_sens,   2),
+        "Q_latent_kW"        : round(Q_latent,      2),
+        "Q_superheat_kW"     : round(Q_superheat,   2),
+        "Q_net_kW"           : round(Q_net,         2),
+        "Q_design_kW"        : round(Q_design,      2),
+        "Q_design_MJ_h"      : round(Q_design * 3.6, 2),
+        "T_outlet_C"         : round(T_out_K - 273.15, 1),
+        "LMTD_K"             : round(LMTD,          2),
+        "A_required_m2"      : round(A_required_m2, 2),
+        "A_provided_m2"      : vap["fin_area_m2"],
+        "area_adequate"      : A_required_m2 <= vap["fin_area_m2"],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5. FROSTING RISK ASSESSMENT  (critical for atmospheric vaporisers)
+# ──────────────────────────────────────────────────────────────────────────
+
+def frost_risk(T_amb_C: float, rel_humidity: float, Q_kW: float) -> str:
+    """
+    Simple frost index: if fin surface temperature drops below 0°C
+    AND humid air, frosting occurs, reducing HTC over time.
+    """
+    # Approximate fin surface temperature using simplified resistance model
+    # T_fin ≈ T_amb - (Q / (U * A)) expressed as fraction of driving force
+    # For AAV, fin tip approaches LNG temperature
+    T_fin_approx = -30.0  # conservative estimate for fin root region (°C)
+    dew_point_approx = T_amb_C - ((100 - rel_humidity * 100) / 5.0)
+
+    if T_fin_approx < 0 and dew_point_approx > T_fin_approx:
+        return "HIGH – Frost accumulation expected; de-icing / duty-standby rotation required"
+    elif T_fin_approx < 0:
+        return "MEDIUM – Sub-zero fins; monitor for light frost"
+    else:
+        return "LOW – No significant frost expected"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6. MAIN: RUN CALCULATIONS & PRINT REPORT
+# ──────────────────────────────────────────────────────────────────────────
+
+def separator(char="═", width=78):
+    print(char * width)
+
+def run_all():
+    separator()
+    print("  GAIL GAS LIMITED – LNG Regasification Station, Mandideep")
+    print("  Vaporiser Heat Exchanger Capacity Report")
+    print("  Drawing Ref: CG-P16/19-002  |  Consultant: MECON Limited")
+    separator()
+
+    summary_table = []   # for compact comparison at end
+
+    for season, amb in AMBIENT.items():
+        T_amb = amb["T_amb_C"]
+        RH    = amb["relative_humidity"]
+
+        separator("─")
+        print(f"\n  SEASON: {season.upper()}  |  T_ambient = {T_amb}°C  |  RH = {int(RH*100)}%  |  Wind = {amb['wind_speed_mps']} m/s\n")
+        separator("─")
+
+        for vap_key, vap in VAPORISERS.items():
+            res = calc_heat_duty(vap, T_amb)
+            frost = frost_risk(T_amb, RH, res["Q_design_kW"])
+
+            print(f"\n  ┌─ {vap['label']}")
+            print(f"  │  Inlet Pressure  : {vap['inlet_press_barg']} barg")
+            print(f"  │  Outlet Pressure : {vap['outlet_press_barg']} barg")
+            print(f"  │  LNG Flow Rate   : {vap['flow_rate_kg_h']} kg/h")
+            print(f"  │  LNG Inlet Temp  : {LNG_INLET_TEMP_C} °C")
+            print(f"  │  NG Outlet Temp  : {res['T_outlet_C']} °C")
+            print(f"  │")
+            print(f"  │  Heat Duty Breakdown:")
+            print(f"  │    Sensible (liquid) : {res['Q_sensible_liq_kW']:>9.2f}  kW")
+            print(f"  │    Latent (vaporise) : {res['Q_latent_kW']:>9.2f}  kW")
+            print(f"  │    Superheat (vapour): {res['Q_superheat_kW']:>9.2f}  kW")
+            print(f"  │    ─────────────────────────────")
+            print(f"  │    Net Duty          : {res['Q_net_kW']:>9.2f}  kW")
+            print(f"  │    Design Duty (×{vap['safety_factor']:.2f}): {res['Q_design_kW']:>9.2f}  kW  ({res['Q_design_MJ_h']} MJ/h)")
+            print(f"  │")
+            print(f"  │  Heat Transfer Analysis:")
+            print(f"  │    LMTD              : {res['LMTD_K']:>9.2f}  K")
+            print(f"  │    Overall HTC (U)   : {vap['U_W_m2K']:>9.1f}  W/(m²·K)")
+            print(f"  │    Area Required     : {res['A_required_m2']:>9.2f}  m²")
+            print(f"  │    Area Provided     : {res['A_provided_m2']:>9.1f}  m²")
+            print(f"  │    Area Check        : {'✓ ADEQUATE' if res['area_adequate'] else '✗ UNDERSIZED – increase fin area!'}")
+            print(f"  │")
+            print(f"  │  Frost Risk          : {frost}")
+            print(f"  └{'─'*65}")
+
+            summary_table.append({
+                "Season"  : season,
+                "Vaporiser": vap_key,
+                "Q_net_kW": res["Q_net_kW"],
+                "Q_des_kW": res["Q_design_kW"],
+                "A_req_m2": res["A_required_m2"],
+                "OK"      : "✓" if res["area_adequate"] else "✗",
+            })
+
+        print()
+
+    # ── Compact Summary Table ──────────────────────────────────────────────
+    separator()
+    print(f"\n  {'SUMMARY TABLE':^74}")
+    separator("─")
+    hdr = f"  {'Season':<8} {'Vaporiser':<20} {'Q_net (kW)':<14} {'Q_design (kW)':<16} {'A_req (m²)':<13} Status"
+    print(hdr)
+    separator("─")
+    for r in summary_table:
+        print(f"  {r['Season']:<8} {r['Vaporiser']:<20} {r['Q_net_kW']:<14.2f} {r['Q_des_kW']:<16.2f} {r['A_req_m2']:<13.2f} {r['OK']}")
+    separator()
+    print()
+
+    # ── Design Recommendations ─────────────────────────────────────────────
+    print("  DESIGN RECOMMENDATIONS")
+    separator("─")
+    print("""
+  1. DUTY-STANDBY ROTATION:
+     Atmospheric vaporisers accumulate frost (ice) on fins, reducing heat
+     transfer over time. Implement 2-on / 1-standby rotation every 4-6 hrs
+     during winter or high-humidity periods.
+
+  2. CAPACITY DERATING IN WINTER:
+     At 8°C ambient, driving ΔT is significantly lower than summer (42°C),
+     leading to larger required heat-transfer area. Verify installed fin
+     area meets winter Q_design figures above.
+
+  3. HP VAPORISER SPECIAL CARE:
+     At 200 barg, dense-phase NG has lower Cp variability; confirm U-value
+     experimentally. Add a minimum outlet temperature controller (TIC) to
+     prevent cold gas from reaching dispenser nozzles.
+
+  4. OUTLET TEMPERATURE:
+     Per IS/IGC standards, NG leaving vaporiser should be ≥ +5°C before
+     entering pressure regulators to avoid hydrate formation.
+
+  5. SAFETY RELIEF:
+     Each vaporiser must have a PSV/SRV as shown in P&ID. Confirm SRV set
+     points match line class ratings (SS1/SS3/SS6/CS1 per legend sheet).
+  """)
+    separator()
+
+
+if __name__ == "__main__":
+    run_all()
+
+import pandas as pd
+import numpy as np
+
+data = []
+
+for season, amb in AMBIENT.items():
+
+    for vap_name, vap in VAPORISERS.items():
+
+        res = calc_heat_duty(vap, amb["T_amb_C"])
+
+        data.append({
+            "Season": season,
+            "Vaporizer": vap_name,
+            "FlowRate_kg_h": vap["flow_rate_kg_h"],
+            "Q_net_kW": res["Q_net_kW"],
+            "Q_design_kW": res["Q_design_kW"],
+            "LMTD_K": res["LMTD_K"],
+            "AreaRequired_m2": res["A_required_m2"],
+            "AreaProvided_m2": res["A_provided_m2"]
+        })
+
+df = pd.DataFrame(data)
+
+print(df)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure(figsize=(10,6))
+
+sns.barplot(
+    data=df,
+    x="Vaporizer",
+    y="Q_design_kW",
+    hue="Season"
+)
+
+plt.title("Design Heat Duty Comparison")
+plt.ylabel("Heat Duty (kW)")
+plt.show()
+
+plt.figure(figsize=(10,6))
+
+sns.barplot(
+    data=df,
+    x="Vaporizer",
+    y="AreaRequired_m2",
+    hue="Season"
+)
+
+plt.title("Required Heat Transfer Area")
+plt.ylabel("Area (m²)")
+plt.show()
+
+summer = df[df["Season"]=="Summer"]
+winter = df[df["Season"]=="Winter"]
+
+change = (
+    (summer["Q_design_kW"].values -
+     winter["Q_design_kW"].values)
+    /
+    winter["Q_design_kW"].values
+)*100
+
+for vap, pct in zip(summer["Vaporizer"], change):
+    print(vap, round(pct,2), "%")
+
+
+
