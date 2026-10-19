@@ -1,0 +1,128 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+from sklearn.linear_model import LinearRegression, SGDRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+
+# ------------------------------------------------------------------
+# 1. Load data (TOTAL sheet)
+# ------------------------------------------------------------------
+df = pd.read_excel("vaporiser_capacity_sweep.xlsx", sheet_name="TOTAL")
+
+X = df[["T_amb (°C)"]]                       # input: ambient temperature
+y = df["TOTAL revenue @max (Rs Cr/yr)"]      # target: total revenue
+
+# ------------------------------------------------------------------
+# 2. Train / test split
+#    Only 51 rows and one feature, so a random split is fine here
+#    (we are interpolating between temperatures, not forecasting).
+# ------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ------------------------------------------------------------------
+# 3. Models to compare
+# ------------------------------------------------------------------
+models = {
+    "Linear Regression": LinearRegression(),
+
+    "Polynomial Regression (deg 3)": make_pipeline(
+        PolynomialFeatures(degree=3), LinearRegression()
+    ),
+
+    "SGD Regressor (gradient descent)": make_pipeline(
+        StandardScaler(),
+        SGDRegressor(max_iter=5000, tol=1e-4, eta0=0.01, random_state=42),
+    ),
+
+    "KNN Regressor": make_pipeline(
+        StandardScaler(), KNeighborsRegressor(n_neighbors=3)
+    ),
+
+    "SVR (RBF kernel)": TransformedTargetRegressor(
+        regressor=make_pipeline(StandardScaler(), SVR(C=10, epsilon=0.05)),
+        transformer=StandardScaler(),
+    ),
+
+    "Decision Tree": DecisionTreeRegressor(max_depth=5, random_state=42),
+
+    "Random Forest": RandomForestRegressor(n_estimators=200, random_state=42),
+
+    "Gradient Boosting": GradientBoostingRegressor(
+        n_estimators=200, learning_rate=0.1, max_depth=3, random_state=42
+    ),
+}
+
+# ------------------------------------------------------------------
+# 4. Train, predict, evaluate
+#    5-fold cross-validated R2 is added because a test set of ~11 rows
+#    gives a noisy score.
+# ------------------------------------------------------------------
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+results = []
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    pred_train = model.predict(X_train)
+    pred_test = model.predict(X_test)
+
+    cv_r2 = cross_val_score(model, X, y, cv=kf, scoring="r2").mean()
+
+    results.append({
+        "Model": name,
+        "Train R2": r2_score(y_train, pred_train),
+        "Test R2": r2_score(y_test, pred_test),
+        "CV R2 (5-fold)": cv_r2,
+        "Test MAE (Rs Cr/yr)": mean_absolute_error(y_test, pred_test),
+        "Test RMSE (Rs Cr/yr)": np.sqrt(mean_squared_error(y_test, pred_test)),
+    })
+
+results_df = (
+    pd.DataFrame(results)
+    .sort_values("CV R2 (5-fold)", ascending=False)
+    .reset_index(drop=True)
+)
+print(results_df.round(4).to_string(index=False))
+
+# ------------------------------------------------------------------
+# 5. Plot every model's fitted curve against the real data
+# ------------------------------------------------------------------
+T_grid = pd.DataFrame({"T_amb (°C)": np.linspace(0, 50, 500)})
+
+fig, axes = plt.subplots(2, 4, figsize=(18, 8), sharex=True, sharey=True)
+for ax, (name, model) in zip(axes.ravel(), models.items()):
+    ax.scatter(X_train, y_train, s=18, label="Train", color="tab:blue")
+    ax.scatter(X_test, y_test, s=28, label="Test", color="tab:red")
+    ax.plot(T_grid, model.predict(T_grid), color="black", lw=1.5)
+    r2 = r2_score(y_test, model.predict(X_test))
+    ax.set_title(f"{name}\nTest R2 = {r2:.3f}", fontsize=10)
+    ax.grid(alpha=0.3)
+axes[0, 0].legend()
+fig.supxlabel("Ambient temperature (°C)")
+fig.supylabel("Total revenue (Rs Cr/yr)")
+plt.tight_layout()
+plt.savefig("model_comparison.png", dpi=150)
+plt.show()
+
+# ------------------------------------------------------------------
+# 6. Predict revenue for new temperatures with the best model
+# ------------------------------------------------------------------
+best_name = results_df.loc[0, "Model"]
+best_model = models[best_name]
+best_model.fit(X, y)                         # refit on all data
+
+new_T = pd.DataFrame({"T_amb (°C)": [8, 12, 22.5, 35, 47]})
+new_T["Predicted revenue (Rs Cr/yr)"] = best_model.predict(new_T[["T_amb (°C)"]]).round(2)
+print(f"\nBest model: {best_name}")
+print(new_T.to_string(index=False))
